@@ -2,7 +2,9 @@ package nylog
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
 )
 
 type ctxKey string
@@ -20,6 +22,7 @@ func WithContextAttr(parent context.Context, attrs ...slog.Attr) context.Context
 }
 
 type ContextExtractor func(ctx context.Context) []slog.Attr
+type WriteErrorHandler func(err error, r slog.Record)
 
 // defaultTraceExtractor 默认提取器：未自定义时，自动从 Context 提取 "trace_id" 或 "request_id"
 func defaultTraceExtractor(ctx context.Context) []slog.Attr {
@@ -36,13 +39,20 @@ func defaultTraceExtractor(ctx context.Context) []slog.Attr {
 	return attrs
 }
 
-// TeeHandler 实现 slog.Handler 接口，支持多后端双写分流与 Context 属性自动提取
+// TeeHandler 实现 slog.Handler 接口，支持多后端双写分流、Context 动态属性提取及错误降级兜底
 type TeeHandler struct {
 	handlers          []slog.Handler
 	contextExtractors []ContextExtractor
+	writeErrorHandler WriteErrorHandler
 }
 
 func NewTeeHandler(handlers ...slog.Handler) *TeeHandler {
+	// 空 Handler 场景保护：若没有传入任何有效 Handler，至少输出控制台兜底，防止静默丢日志
+	if len(handlers) == 0 {
+		fmt.Fprintln(os.Stderr, "[nylog WARNING] No valid handlers configured. Falling back to os.Stderr JSON output.")
+		handlers = []slog.Handler{slog.NewJSONHandler(os.Stderr, nil)}
+	}
+
 	return &TeeHandler{
 		handlers:          handlers,
 		contextExtractors: []ContextExtractor{defaultTraceExtractor},
@@ -58,6 +68,12 @@ func (h *TeeHandler) WithExtractors(extractors ...ContextExtractor) *TeeHandler 
 	return &h2
 }
 
+func (h *TeeHandler) WithErrorHandler(fn WriteErrorHandler) *TeeHandler {
+	h2 := *h
+	h2.writeErrorHandler = fn
+	return &h2
+}
+
 func (h *TeeHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	for _, handler := range h.handlers {
 		if handler.Enabled(ctx, level) {
@@ -69,7 +85,7 @@ func (h *TeeHandler) Enabled(ctx context.Context, level slog.Level) bool {
 
 func (h *TeeHandler) Handle(ctx context.Context, r slog.Record) error {
 	if ctx != nil {
-		// 1. 从 Context 提取通用绑定的 Context 动态属性 (如通过 WithContextAttr 绑定的属性)
+		// 1. 从 Context 提取通用绑定的 Context 动态属性
 		if attrs, ok := ctx.Value(slogContextAttrsKey).([]slog.Attr); ok && len(attrs) > 0 {
 			r.AddAttrs(attrs...)
 		}
@@ -81,13 +97,22 @@ func (h *TeeHandler) Handle(ctx context.Context, r slog.Record) error {
 		}
 	}
 
-	// 3. 多 Handler 扇出分流
+	// 3. 多 Handler 扇出分流与写入异常捕获
+	var writeErr error
 	for _, handler := range h.handlers {
 		if handler.Enabled(ctx, r.Level) {
-			_ = handler.Handle(ctx, r.Clone())
+			if err := handler.Handle(ctx, r.Clone()); err != nil {
+				writeErr = err
+				if h.writeErrorHandler != nil {
+					h.writeErrorHandler(err, r)
+				} else {
+					// 默认落盘失败降级输出到 os.Stderr，防止问题被静默吞掉
+					fmt.Fprintf(os.Stderr, "[nylog ERROR] Log handler write failed: %v | msg: %s\n", err, r.Message)
+				}
+			}
 		}
 	}
-	return nil
+	return writeErr
 }
 
 func (h *TeeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -95,7 +120,11 @@ func (h *TeeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	for i, handler := range h.handlers {
 		newHandlers[i] = handler.WithAttrs(attrs)
 	}
-	return &TeeHandler{handlers: newHandlers, contextExtractors: h.contextExtractors}
+	return &TeeHandler{
+		handlers:          newHandlers,
+		contextExtractors: h.contextExtractors,
+		writeErrorHandler: h.writeErrorHandler,
+	}
 }
 
 func (h *TeeHandler) WithGroup(name string) slog.Handler {
@@ -103,5 +132,9 @@ func (h *TeeHandler) WithGroup(name string) slog.Handler {
 	for i, handler := range h.handlers {
 		newHandlers[i] = handler.WithGroup(name)
 	}
-	return &TeeHandler{handlers: newHandlers, contextExtractors: h.contextExtractors}
+	return &TeeHandler{
+		handlers:          newHandlers,
+		contextExtractors: h.contextExtractors,
+		writeErrorHandler: h.writeErrorHandler,
+	}
 }

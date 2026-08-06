@@ -26,6 +26,7 @@ type Options struct {
 	extraHandlers     []slog.Handler
 	replaceAttrs      []func(groups []string, a slog.Attr) slog.Attr
 	contextExtractors []ContextExtractor
+	writeErrorHandler WriteErrorHandler
 }
 
 type Option func(*Options)
@@ -69,10 +70,24 @@ func WithTraceKey(ctxKey any, attrKey string) Option {
 	}
 }
 
+// WithWriteErrorHandler 允许用户注入写磁盘/投递失败时的报警回调钩子
+func WithWriteErrorHandler(fn WriteErrorHandler) Option {
+	return func(o *Options) {
+		o.writeErrorHandler = fn
+	}
+}
+
 // InitLogger 全局日志初始化 (支持 Functional Options 扩展)
 func InitLogger(conf Config, options ...Option) *Logger {
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
+
+	// 1. 配置合规性校验与兜底
+	if err := conf.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "[nylog WARNING] Config validation error: %v. Falling back to DefaultConfig.\n", err)
+		conf = DefaultConfig()
+		_ = conf.Validate()
+	}
 
 	optsImpl := &Options{}
 	for _, opt := range options {
@@ -84,7 +99,7 @@ func InitLogger(conf Config, options ...Option) *Logger {
 
 	opts := &slog.HandlerOptions{
 		Level:     levelVar,
-		AddSource: true,
+		AddSource: conf.IsAddSourceEnabled(),
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			// 执行用户注入的 ReplaceAttr 钩子
 			for _, fn := range optsImpl.replaceAttrs {
@@ -95,7 +110,10 @@ func InitLogger(conf Config, options ...Option) *Logger {
 			}
 			if a.Key == slog.SourceKey {
 				if source, ok := a.Value.Any().(*slog.Source); ok {
-					return slog.String("caller", fmt.Sprintf("%s:%d", filepath.Base(source.File), source.Line))
+					// 提升源位置粒度：输出 目录名/文件名:行号 (如 nylog/logger.go:98)
+					pkgDir := filepath.Base(filepath.Dir(source.File))
+					fileName := filepath.Base(source.File)
+					return slog.String("caller", fmt.Sprintf("%s/%s:%d", pkgDir, fileName, source.Line))
 				}
 			}
 			return a
@@ -104,6 +122,7 @@ func InitLogger(conf Config, options ...Option) *Logger {
 
 	var handlers []slog.Handler
 
+	// 控制台 Handler
 	if conf.EnableConsole {
 		if conf.Format == FileFormatJSON {
 			handlers = append(handlers, slog.NewJSONHandler(os.Stdout, opts))
@@ -112,17 +131,29 @@ func InitLogger(conf Config, options ...Option) *Logger {
 		}
 	}
 
+	// 主文件 Handler
 	if conf.File.Filename != "" {
 		fileWriter := getLumberjackWriter(conf.File.Filename, conf.File)
 		handlers = append(handlers, slog.NewJSONHandler(fileWriter, opts))
 	}
 
-	// 注入用户自定义的扩展 Handler (如第三方 ES / Kafka / Sentry / Tint 处理器)
+	// 独立 Error 文件 Handler (若配置)
+	if conf.ErrorFilename != "" {
+		errFileWriter := getLumberjackWriter(conf.ErrorFilename, conf.File)
+		errOpts := *opts
+		errOpts.Level = slog.LevelError
+		handlers = append(handlers, slog.NewJSONHandler(errFileWriter, &errOpts))
+	}
+
+	// 注入用户扩展 Handler
 	if len(optsImpl.extraHandlers) > 0 {
 		handlers = append(handlers, optsImpl.extraHandlers...)
 	}
 
-	tee := NewTeeHandler(handlers...).WithExtractors(optsImpl.contextExtractors...)
+	tee := NewTeeHandler(handlers...).
+		WithExtractors(optsImpl.contextExtractors...).
+		WithErrorHandler(optsImpl.writeErrorHandler)
+
 	l := slog.New(tee)
 
 	inst := &Logger{
@@ -177,7 +208,7 @@ func (l *Logger) Attach(moduleName string) *Logger {
 
 	subHandler := slog.NewJSONHandler(fileWriter, &slog.HandlerOptions{
 		Level:     l.levelVar,
-		AddSource: true,
+		AddSource: l.conf.IsAddSourceEnabled(),
 	})
 
 	return &Logger{
@@ -195,7 +226,7 @@ func (l *Logger) Detach(moduleName string) *Logger {
 	targetPath := filepath.Join(l.conf.AttachLogDir, fmt.Sprintf("detach_%s.log", moduleName))
 	fileWriter := getLumberjackWriter(targetPath, l.conf.File)
 
-	opts := &slog.HandlerOptions{Level: l.levelVar, AddSource: true}
+	opts := &slog.HandlerOptions{Level: l.levelVar, AddSource: l.conf.IsAddSourceEnabled()}
 	var handlers []slog.Handler
 
 	if l.conf.EnableConsole {
@@ -211,6 +242,7 @@ func (l *Logger) Detach(moduleName string) *Logger {
 }
 
 // --- 包级别顶层快捷 API (直接代理全局单例，进一步提升开发体验) ---
+
 func Sync() error {
 	return Get().Sync()
 }

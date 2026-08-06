@@ -346,3 +346,95 @@ func TestCustomTraceKey(t *testing.T) {
 		t.Errorf("预期日志包含自定义 trace_id，实际内容: %s", content)
 	}
 }
+
+// TestSpecializedMasking 测试细粒度的专用脱敏函数
+func TestSpecializedMasking(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := getTestTmpDir(t)
+	logFile := filepath.Join(tmpDir, "test_specialized_mask.log")
+
+	logger := InitLogger(Config{
+		Level:         "info",
+		Format:        "json",
+		EnableConsole: false,
+		File:          FileConfig{Filename: logFile},
+	})
+
+	logger.InfoAttrs(ctx, "测试专有脱敏",
+		MaskMobile("mobile", "13800138000"),
+		MaskEmail("email", "zhangsan@domain.com"),
+		MaskIDCard("id_card", "110101199003071234"),
+		MaskBankCard("bank_card", "6222021204000001234"),
+	)
+
+	data, _ := os.ReadFile(logFile)
+	content := string(data)
+
+	if !strings.Contains(content, `"mobile":"138****8000"`) {
+		t.Errorf("手机号脱敏失败: %s", content)
+	}
+	if !strings.Contains(content, `"email":"z***n@domain.com"`) {
+		t.Errorf("邮箱脱敏失败: %s", content)
+	}
+	if !strings.Contains(content, `"id_card":"110101******1234"`) {
+		t.Errorf("身份证号脱敏失败: %s", content)
+	}
+	if !strings.Contains(content, `"bank_card":"622202******1234"`) {
+		t.Errorf("银行卡号脱敏失败: %s", content)
+	}
+}
+
+// TestConfigValidation 测试配置校验与容错兜底
+func TestConfigValidation(t *testing.T) {
+	invalidCfg := Config{
+		Level:         "invalid_level",
+		EnableConsole: false,
+	}
+
+	err := invalidCfg.Validate()
+	if err == nil {
+		t.Error("预期非法 Level 返回校验错误")
+	}
+
+	noTargetCfg := Config{
+		EnableConsole: false,
+	}
+	err = noTargetCfg.Validate()
+	if !errors.Is(err, ErrNoLogOutputTarget) {
+		t.Errorf("预期无输出目标返回 ErrNoLogOutputTarget，实际: %v", err)
+	}
+}
+
+// TestErrorFilename Separate error log file testing
+func TestErrorFilename(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := getTestTmpDir(t)
+	mainLog := filepath.Join(tmpDir, "main.log")
+	errLog := filepath.Join(tmpDir, "error.log")
+
+	logger := InitLogger(Config{
+		Level:         "info",
+		Format:        "json",
+		EnableConsole: false,
+		File:          FileConfig{Filename: mainLog},
+		ErrorFilename: errLog,
+	})
+
+	logger.InfoAttrs(ctx, "正常信息")
+	logger.ErrorAttrs(ctx, "异常报错", errors.New("something went wrong"))
+
+	time.Sleep(50 * time.Millisecond)
+
+	mainData, _ := os.ReadFile(mainLog)
+	errData, _ := os.ReadFile(errLog)
+
+	if !strings.Contains(string(mainData), "正常信息") || !strings.Contains(string(mainData), "异常报错") {
+		t.Errorf("主日志应该包含 Info 和 Error: %s", string(mainData))
+	}
+	if strings.Contains(string(errData), "正常信息") {
+		t.Errorf("独立 Error 日志不应该包含 Info: %s", string(errData))
+	}
+	if !strings.Contains(string(errData), "异常报错") {
+		t.Errorf("独立 Error 日志应该包含 Error: %s", string(errData))
+	}
+}

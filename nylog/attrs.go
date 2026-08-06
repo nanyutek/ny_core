@@ -1,6 +1,9 @@
 package nylog
 
-import "log/slog"
+import (
+	"log/slog"
+	"strings"
+)
 
 // --- 强类型 Attr 构建器 (替代裸字符串, 彻底规避 !BADKEY 陷阱) ---
 
@@ -25,12 +28,55 @@ func Err(err error) slog.Attr {
 	return slog.String("error", err.Error())
 }
 
-// Mask 脱敏助手 (如 Phone: 138****1234, Email: a***@qq.com)
+// --- 常用敏感数据脱敏助手函数 ---
+
+// Mask 通用保底脱敏 (保留前3后4)
 func Mask(key, val string) slog.Attr {
 	if len(val) <= 4 {
 		return slog.String(key, "****")
 	}
+	if len(val) <= 7 {
+		return slog.String(key, val[:2]+"****"+val[len(val)-1:])
+	}
 	return slog.String(key, val[:3]+"****"+val[len(val)-4:])
+}
+
+// MaskMobile 手机号脱敏 (例: 138****1234)
+func MaskMobile(key, mobile string) slog.Attr {
+	if len(mobile) != 11 {
+		return Mask(key, mobile)
+	}
+	return slog.String(key, mobile[:3]+"****"+mobile[7:])
+}
+
+// MaskEmail 邮箱脱敏 (例: a***@domain.com)
+func MaskEmail(key, email string) slog.Attr {
+	atIdx := strings.Index(email, "@")
+	if atIdx <= 1 {
+		return slog.String(key, "*@*")
+	}
+	name := email[:atIdx]
+	domain := email[atIdx:]
+	if len(name) <= 2 {
+		return slog.String(key, name[:1]+"***"+domain)
+	}
+	return slog.String(key, name[:1]+"***"+name[len(name)-1:]+domain)
+}
+
+// MaskIDCard 身份证号脱敏 (例: 110101******1234)
+func MaskIDCard(key, idCard string) slog.Attr {
+	if len(idCard) != 18 {
+		return Mask(key, idCard)
+	}
+	return slog.String(key, idCard[:6]+"******"+idCard[14:])
+}
+
+// MaskBankCard 银行卡号脱敏 (例: 622202******1234)
+func MaskBankCard(key, cardNo string) slog.Attr {
+	if len(cardNo) < 12 {
+		return Mask(key, cardNo)
+	}
+	return slog.String(key, cardNo[:6]+"******"+cardNo[len(cardNo)-4:])
 }
 
 // SensitiveUser 结构体自动脱敏示范 (实现 slog.LogValuer 接口)
@@ -42,14 +88,10 @@ type SensitiveUser struct {
 }
 
 func (u SensitiveUser) LogValue() slog.Value {
-	cc := u.CreditCard
-	if len(cc) > 4 {
-		cc = "****-****-****-" + cc[len(cc)-4:]
-	}
 	return slog.GroupValue(
 		slog.String("id", u.ID),
 		slog.String("name", u.Name),
 		slog.String("password", "******"),
-		slog.String("credit_card", cc),
+		slog.String("credit_card", MaskBankCard("cc", u.CreditCard).Value.String()),
 	)
 }
